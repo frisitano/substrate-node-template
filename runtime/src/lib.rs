@@ -14,9 +14,9 @@ use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
 use sp_runtime::{
 	create_runtime_str, generic, impl_opaque_keys,
-	traits::{AccountIdLookup, BlakeTwo256, Block as BlockT, IdentifyAccount, NumberFor, Verify},
+	traits::{AccountIdLookup, BlakeTwo256, Block as BlockT, IdentifyAccount, NumberFor, Verify, OpaqueKeys},
 	transaction_validity::{TransactionSource, TransactionValidity},
-	ApplyExtrinsicResult, MultiSignature,
+	ApplyExtrinsicResult, MultiSignature, curve::PiecewiseLinear
 };
 use sp_std::prelude::*;
 #[cfg(feature = "std")]
@@ -26,16 +26,19 @@ use sp_version::RuntimeVersion;
 // A few exports that help ease life for downstream crates.
 pub use frame_support::{
 	construct_runtime, parameter_types,
-	traits::{KeyOwnerProofSystem, Randomness, StorageInfo},
+	traits::{U128CurrencyToVote, KeyOwnerProofSystem, Randomness, StorageInfo},
 	weights::{
 		constants::{BlockExecutionWeight, ExtrinsicBaseWeight, RocksDbWeight, WEIGHT_PER_SECOND},
 		IdentityFee, Weight,
 	},
 	StorageValue,
 };
+use frame_election_provider_support::onchain;
 pub use pallet_balances::Call as BalancesCall;
 pub use pallet_timestamp::Call as TimestampCall;
 use pallet_transaction_payment::CurrencyAdapter;
+pub use pallet_staking::StakerStatus;
+use pallet_contracts::weights::WeightInfo;
 #[cfg(any(feature = "std", test))]
 pub use sp_runtime::BuildStorage;
 pub use sp_runtime::{Perbill, Permill};
@@ -271,6 +274,188 @@ impl pallet_template::Config for Runtime {
 	type Event = Event;
 }
 
+impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
+where
+	Call: From<C>,
+{
+	type Extrinsic = UncheckedExtrinsic;
+	type OverarchingCall = Call;
+}
+
+pallet_staking_reward_curve::build! {
+	const REWARD_CURVE: PiecewiseLinear<'static> = curve!(
+		min_inflation: 0_025_000,
+		max_inflation: 0_100_000,
+		ideal_stake: 0_500_000,
+		falloff: 0_050_000,
+		max_piece_count: 40,
+		test_precision: 0_005_000,
+	);
+}
+
+parameter_types! {
+	pub const SessionsPerEra: sp_staking::SessionIndex = 24;
+	pub const BondingDuration: pallet_staking::EraIndex = 28;
+	pub const SlashDeferDuration: pallet_staking::EraIndex = 27;
+	pub const RewardCurve: &'static PiecewiseLinear<'static> = &REWARD_CURVE;
+	pub const MaxNominatorRewardPerValidator: u32 = 64;
+}
+
+impl onchain::Config for Runtime {
+	type AccountId = AccountId;
+	type BlockNumber = BlockNumber;
+	type Accuracy = sp_runtime::Perbill;
+	type DataProvider = Staking;
+}
+
+impl pallet_staking::Config for Runtime {
+	const MAX_NOMINATIONS: u32 = 16;
+	type Currency = Balances;
+	type UnixTime = Timestamp;
+	type CurrencyToVote = U128CurrencyToVote;
+	type ElectionProvider = onchain::OnChainSequentialPhragmen<Self>;
+	type GenesisElectionProvider = onchain::OnChainSequentialPhragmen<Self>;
+	type RewardRemainder = ();
+	type Event = Event;
+	type Slash = ();
+	type Reward = ();
+	type SessionsPerEra = SessionsPerEra;
+	type BondingDuration = BondingDuration;
+	type SlashDeferDuration = SlashDeferDuration;
+	type SlashCancelOrigin = frame_system::EnsureRoot<AccountId>;
+	type SessionInterface = Self;
+	type EraPayout = pallet_staking::ConvertCurve<RewardCurve>;
+	type NextNewSession = ();
+	type MaxNominatorRewardedPerValidator = MaxNominatorRewardPerValidator;
+	type WeightInfo = ();
+}
+
+parameter_types! {
+	pub const DisabledValidatorsThreshold: Perbill = Perbill::from_percent(17);
+	pub const Period: u32 = 1 * HOURS;
+	pub const Offset: u32 = 0;
+}
+
+impl pallet_session::Config for Runtime {
+	type Event = Event;
+	type ValidatorId = AccountId;
+	type ValidatorIdOf = pallet_staking::StashOf<Self>;
+	type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
+	type NextSessionRotation = pallet_session::PeriodicSessions<Period, Offset>;
+	type SessionManager = pallet_session::historical::NoteHistoricalRoot<Self, Staking>;
+	type SessionHandler = <opaque::SessionKeys as OpaqueKeys>::KeyTypeIdProviders;
+	type Keys = opaque::SessionKeys;
+	type DisabledValidatorsThreshold = DisabledValidatorsThreshold;
+	type WeightInfo = ();
+}
+
+impl pallet_session::historical::Config for Runtime {
+	type FullIdentification = pallet_staking::Exposure<AccountId, Balance>;
+	type FullIdentificationOf = pallet_staking::ExposureOf<Runtime>;
+}
+
+parameter_types! {
+    // Choose a fee that incentivizes desireable behavior.
+    pub const NickReservationFee: u128 = 100;
+    pub const MinNickLength: u32 = 8;
+    // Maximum bounds on storage are important to secure your chain.
+    pub const MaxNickLength: u32 = 32;
+}
+
+impl pallet_nicks::Config for Runtime {
+    // The Balances pallet implements the ReservableCurrency trait.
+    // `Balances` is defined in `construct_runtimes!` macro. See below.
+    // https://substrate.dev/rustdocs/latest/pallet_balances/index.html#implementations-2
+    type Currency = Balances;
+
+    // Use the NickReservationFee from the parameter_types block.
+    type ReservationFee = NickReservationFee;
+
+    // No action is taken when deposits are forfeited.
+    type Slashed = ();
+
+    // Configure the FRAME System Root origin as the Nick pallet admin.
+    // https://substrate.dev/rustdocs/latest/frame_system/enum.RawOrigin.html#variant.Root
+    type ForceOrigin = frame_system::EnsureRoot<AccountId>;
+
+    // Use the MinNickLength from the parameter_types block.
+    type MinLength = MinNickLength;
+
+    // Use the MaxNickLength from the parameter_types block.
+    type MaxLength = MaxNickLength;
+
+    // The ubiquitous event type.
+    type Event = Event;
+}
+
+// Contracts price units.
+pub const MILLICENTS: Balance = 1_000_000_000;
+pub const CENTS: Balance = 1_000 * MILLICENTS;
+pub const DOLLARS: Balance = 100 * CENTS;
+
+const fn deposit(items: u32, bytes: u32) -> Balance {
+   items as Balance * 15 * CENTS + (bytes as Balance) * 6 * CENTS
+}
+
+/// We assume that ~10% of the block weight is consumed by `on_initialize` handlers.
+/// This is used to limit the maximal weight of a single extrinsic.
+const AVERAGE_ON_INITIALIZE_RATIO: Perbill = Perbill::from_percent(10);
+
+parameter_types! {
+   pub TombstoneDeposit: Balance = deposit(
+      1,
+      <pallet_contracts::Pallet<Runtime>>::contract_info_size()
+   );
+   pub DepositPerContract: Balance = TombstoneDeposit::get();
+   pub const DepositPerStorageByte: Balance = deposit(0, 1);
+   pub const DepositPerStorageItem: Balance = deposit(1, 0);
+   pub RentFraction: Perbill = Perbill::from_rational(1u32, 30 * DAYS);
+   pub const SurchargeReward: Balance = 150 * MILLICENTS;
+   pub const SignedClaimHandicap: u32 = 2;
+   pub const MaxValueSize: u32 = 16 * 1024;
+   // The lazy deletion runs inside on_initialize.
+   pub DeletionWeightLimit: Weight = AVERAGE_ON_INITIALIZE_RATIO *
+      BlockWeights::get().max_block;
+   // The weight needed for decoding the queue should be less or equal than a fifth
+   // of the overall weight dedicated to the lazy deletion.
+   pub DeletionQueueDepth: u32 = ((DeletionWeightLimit::get() / (
+         <Runtime as pallet_contracts::Config>::WeightInfo::on_initialize_per_queue_item(1) -
+         <Runtime as pallet_contracts::Config>::WeightInfo::on_initialize_per_queue_item(0)
+      )) / 5) as u32;
+
+   pub Schedule: pallet_contracts::Schedule<Runtime> = Default::default();
+}
+
+impl pallet_contracts::Config for Runtime {
+   type Time = Timestamp;
+   type Randomness = RandomnessCollectiveFlip;
+   type Currency = Balances;
+   type Event = Event;
+   type RentPayment = ();
+   type SignedClaimHandicap = SignedClaimHandicap;
+   type TombstoneDeposit = TombstoneDeposit;
+   type DepositPerContract = DepositPerContract;
+   type DepositPerStorageByte = DepositPerStorageByte;
+   type DepositPerStorageItem = DepositPerStorageItem;
+   type RentFraction = RentFraction;
+   type SurchargeReward = SurchargeReward;
+   type WeightPrice = pallet_transaction_payment::Pallet<Self>;
+   type WeightInfo = pallet_contracts::weights::SubstrateWeight<Self>;
+   type ChainExtension = ();
+   type DeletionQueueDepth = DeletionQueueDepth;
+   type DeletionWeightLimit = DeletionWeightLimit;
+   type Call = Call;
+    /// The safest default is to allow no calls at all.
+    ///
+    /// Runtimes should whitelist dispatchables that are allowed to be called from contracts
+    /// and make sure they are stable. Dispatchables exposed to contracts are not allowed to
+    /// change because that would break already deployed contracts. The `Call` structure itself
+    /// is not allowed to change the indices of existing pallets, too.
+    type CallFilter = frame_support::traits::Nothing;
+    type Schedule = Schedule;
+    type CallStack = [pallet_contracts::Frame<Self>; 31];
+}
+
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
 	pub enum Runtime where
@@ -288,6 +473,10 @@ construct_runtime!(
 		Sudo: pallet_sudo::{Pallet, Call, Config<T>, Storage, Event<T>},
 		// Include the custom logic from the pallet-template in the runtime.
 		TemplateModule: pallet_template::{Pallet, Call, Storage, Event<T>},
+		Nicks: pallet_nicks::{Pallet, Call, Storage, Event<T>},
+		Contracts: pallet_contracts::{Pallet, Call, Storage, Event<T>},
+		Staking: pallet_staking::{Pallet, Call, Config<T>, Storage, Event<T>},
+		Session: pallet_session::{Pallet, Call, Storage, Event, Config<T>}
 	}
 );
 
@@ -504,4 +693,45 @@ impl_runtime_apis! {
 			Ok(batches)
 		}
 	}
+
+	impl pallet_contracts_rpc_runtime_api::ContractsApi<Block, AccountId, Balance, BlockNumber, Hash>
+   for Runtime
+   {
+      fn call(
+         origin: AccountId,
+         dest: AccountId,
+         value: Balance,
+         gas_limit: u64,
+         input_data: Vec<u8>,
+      ) -> pallet_contracts_primitives::ContractExecResult {
+         let debug = true;
+         Contracts::bare_call(origin, dest, value, gas_limit, input_data, debug)
+      }
+
+      fn instantiate(
+         origin: AccountId,
+         endowment: Balance,
+         gas_limit: u64,
+         code: pallet_contracts_primitives::Code<Hash>,
+         data: Vec<u8>,
+         salt: Vec<u8>,
+      ) -> pallet_contracts_primitives::ContractInstantiateResult<AccountId, BlockNumber> {
+         let compute_rent_projection = true;
+         let debug = true;
+         Contracts::bare_instantiate(origin, endowment, gas_limit, code, data, salt, compute_rent_projection, debug)
+      }
+
+      fn get_storage(
+         address: AccountId,
+         key: [u8; 32],
+      ) -> pallet_contracts_primitives::GetStorageResult {
+         Contracts::get_storage(address, key)
+      }
+
+      fn rent_projection(
+         address: AccountId,
+      ) -> pallet_contracts_primitives::RentProjectionResult<BlockNumber> {
+         Contracts::rent_projection(address)
+      }
+   }
 }
